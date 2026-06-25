@@ -1,0 +1,7 @@
+profile/
+settings.json
+settings.json.tmp
+crash.log
+packages/
+*.user
+*.suo

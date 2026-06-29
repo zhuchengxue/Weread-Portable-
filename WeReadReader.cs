@@ -2,6 +2,7 @@ using System;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using System.Web.Script.Serialization;
@@ -36,6 +37,7 @@ internal static class Program
             bool createdNew;
             using (var mutex = new Mutex(true, MutexName, out createdNew))
             using (var toggleEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ToggleEventName))
+            using (var shutdownEvent = new ManualResetEvent(false))
             {
                 if (!createdNew)
                 {
@@ -54,9 +56,9 @@ internal static class Program
                 {
                     var watcher = new Thread(delegate()
                     {
-                        while (!form.IsDisposed)
+                        var handles = new WaitHandle[] { toggleEvent, shutdownEvent };
+                        while (WaitHandle.WaitAny(handles) == 0)
                         {
-                            toggleEvent.WaitOne();
                             if (form.IsDisposed) break;
                             try
                             {
@@ -71,6 +73,8 @@ internal static class Program
                     watcher.IsBackground = true;
                     watcher.Start();
                     Application.Run(form);
+                    shutdownEvent.Set();
+                    watcher.Join(1000);
                 }
             }
         }
@@ -86,12 +90,26 @@ internal static class Program
 
 internal sealed class ReaderForm : Form
 {
+    private enum DockEdge
+    {
+        None,
+        Left,
+        Right,
+        Top
+    }
+
     private const int HotkeyId = 1;
     private const uint ModControl = 0x0002;
     private const uint ModShift = 0x0004;
     private const int VkY = 0x59;
     private const int WsMinimizeBox = 0x00020000;
     private const int WsSysMenu = 0x00080000;
+    private const int MinWindowWidth = 320;
+    private const int MinWindowHeight = 520;
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoActivate = 0x0010;
+    private static readonly IntPtr HwndTopMost = new IntPtr(-1);
+    private static readonly IntPtr HwndNotTopMost = new IntPtr(-2);
 
     private readonly string root;
     private readonly string settingsPath;
@@ -108,13 +126,14 @@ internal sealed class ReaderForm : Form
 
     private ReaderSettings settings;
     private Rectangle expandedBounds;
+    private Rectangle collapsedWorkArea;
     private DateTime lastAutoAction = DateTime.MinValue;
     private DateTime lastHeaderChange = DateTime.MinValue;
     private bool collapsed;
     private bool transitioning;
     private bool settingsReady;
     private bool autoHideArmed;
-    private string collapsedEdge = String.Empty;
+    private DockEdge collapsedEdge = DockEdge.None;
 
     [DllImport("user32.dll")]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint modifiers, int key);
@@ -154,18 +173,20 @@ internal sealed class ReaderForm : Form
         settingsPath = Path.Combine(root, "settings.json");
         profilePath = Path.Combine(root, "profile");
         settings = LoadSettings();
-        var hasSavedBounds = File.Exists(settingsPath) && settings.Width >= 240 && settings.Height >= 360;
+        var hasSavedBounds = (File.Exists(settingsPath) || File.Exists(settingsPath + ".tmp")) &&
+                             settings.Width >= MinWindowWidth &&
+                             settings.Height >= MinWindowHeight;
 
         Text = "WeRead";
         StartPosition = FormStartPosition.Manual;
         FormBorderStyle = FormBorderStyle.None;
-        MinimumSize = new Size(320, 520);
+        MinimumSize = new Size(MinWindowWidth, MinWindowHeight);
         KeyPreview = true;
         ShowInTaskbar = true;
 
         var work = Screen.PrimaryScreen.WorkingArea;
-        Width = settings.Width >= 240 ? settings.Width : 390;
-        Height = settings.Height >= 360 ? Math.Min(settings.Height, work.Height) : Math.Min(1040, work.Height);
+        Width = settings.Width >= MinWindowWidth ? settings.Width : 390;
+        Height = settings.Height >= MinWindowHeight ? Math.Min(settings.Height, work.Height) : Math.Min(1040, work.Height);
         Left = hasSavedBounds ? settings.Left : work.Right - Width;
         Top = hasSavedBounds ? settings.Top : work.Top;
         ClampToWorkArea();
@@ -218,7 +239,7 @@ internal sealed class ReaderForm : Form
         readerMenu.Font = new Font("Segoe UI", 9f);
         readerMenu.Items.Add("\u8fd4\u56de", null, delegate { if (webView.CanGoBack) webView.GoBack(); });
         readerMenu.Items.Add("\u9996\u9875", null, delegate { Navigate("https://weread.qq.com/"); });
-        readerMenu.Items.Add("\u5237\u65b0", null, delegate { webView.Reload(); });
+        readerMenu.Items.Add("\u5237\u65b0", null, delegate { ReloadPage(); });
         readerMenu.Items.Add(new ToolStripSeparator());
         readerMenu.Items.Add("\u7f29\u5c0f\u5b57\u53f7", null, delegate { SetZoom(webView.ZoomFactor - 0.1); });
         readerMenu.Items.Add("\u653e\u5927\u5b57\u53f7", null, delegate { SetZoom(webView.ZoomFactor + 0.1); });
@@ -275,7 +296,7 @@ internal sealed class ReaderForm : Form
         menu.Items.Add("Show", null, delegate { ShowReader(); });
         menu.Items.Add("Minimize", null, delegate { MinimizeReader(); });
         menu.Items.Add("Home", null, delegate { ShowReader(); Navigate("https://weread.qq.com/"); });
-        menu.Items.Add("Reload", null, delegate { webView.Reload(); });
+        menu.Items.Add("Reload", null, delegate { ReloadPage(); });
         menu.Items.Add("Exit", null, delegate { Close(); });
         tray.ContextMenuStrip = menu;
         tray.MouseClick += delegate(object sender, MouseEventArgs e)
@@ -290,6 +311,7 @@ internal sealed class ReaderForm : Form
                 settingsReady = true;
                 RegisterHotKey(Handle, HotkeyId, ModControl | ModShift, VkY);
                 await webView.EnsureCoreWebView2Async(null);
+                if (IsDisposed || Disposing) return;
                 webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
                 webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
                 webView.CoreWebView2.WebMessageReceived += delegate(object sender, CoreWebView2WebMessageReceivedEventArgs args)
@@ -497,16 +519,22 @@ internal sealed class ReaderForm : Form
 
     private ReaderSettings LoadSettings()
     {
+        return TryLoadSettings(settingsPath) ??
+               TryLoadSettings(settingsPath + ".tmp") ??
+               Defaults();
+    }
+
+    private ReaderSettings TryLoadSettings(string path)
+    {
         try
         {
-            if (!File.Exists(settingsPath)) return Defaults();
-            var loaded = json.Deserialize<ReaderSettings>(File.ReadAllText(settingsPath));
-            return loaded ?? Defaults();
+            if (!File.Exists(path)) return null;
+            return json.Deserialize<ReaderSettings>(File.ReadAllText(path, Encoding.UTF8));
         }
-        catch
-        {
-            return Defaults();
-        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+        catch (ArgumentException) { return null; }
+        catch (InvalidOperationException) { return null; }
     }
 
     private ReaderSettings Defaults()
@@ -522,20 +550,33 @@ internal sealed class ReaderForm : Form
 
     private void SaveSettings()
     {
-        if (!settingsReady || collapsed || transitioning) return;
-        var bounds = Bounds;
-        if (bounds.Width < 240 || bounds.Height < 360) return;
+        if (!settingsReady) return;
+        var bounds = expandedBounds;
+        if (bounds.Width < MinWindowWidth || bounds.Height < MinWindowHeight) return;
         settings.Width = bounds.Width;
         settings.Height = bounds.Height;
         settings.Left = bounds.Left;
         settings.Top = bounds.Top;
         settings.ZoomFactor = webView.ZoomFactor;
+        var temporaryPath = settingsPath + ".tmp";
         try
         {
-            var temporaryPath = settingsPath + ".tmp";
-            File.WriteAllText(temporaryPath, json.Serialize(settings));
+            File.WriteAllText(temporaryPath, json.Serialize(settings), new UTF8Encoding(false));
             if (File.Exists(settingsPath))
-                File.Replace(temporaryPath, settingsPath, null);
+            {
+                try
+                {
+                    File.Replace(temporaryPath, settingsPath, null);
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    File.Copy(temporaryPath, settingsPath, true);
+                }
+                catch (IOException)
+                {
+                    File.Copy(temporaryPath, settingsPath, true);
+                }
+            }
             else
                 File.Move(temporaryPath, settingsPath);
         }
@@ -546,6 +587,15 @@ internal sealed class ReaderForm : Form
         catch (UnauthorizedAccessException)
         {
             // Portable folders can be read-only.
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
     }
 
@@ -564,7 +614,7 @@ internal sealed class ReaderForm : Form
 
     private void ClampToWorkArea()
     {
-        var work = Screen.FromControl(this).WorkingArea;
+        var work = Screen.FromRectangle(Bounds).WorkingArea;
         Width = Math.Min(Width, work.Width);
         Height = Math.Min(Height, work.Height);
         Left = Math.Max(work.Left, Math.Min(Left, work.Right - Width));
@@ -591,8 +641,14 @@ internal sealed class ReaderForm : Form
         if (webView.CoreWebView2 != null) webView.CoreWebView2.Navigate(url);
     }
 
+    private void ReloadPage()
+    {
+        if (webView.CoreWebView2 != null) webView.CoreWebView2.Reload();
+    }
+
     private void RememberUrl()
     {
+        if (webView.CoreWebView2 == null) return;
         var source = webView.CoreWebView2.Source;
         if (source.StartsWith("https://weread.qq.com/") || source.StartsWith("https://i.weread.qq.com/"))
         {
@@ -618,13 +674,13 @@ internal sealed class ReaderForm : Form
         lastHeaderChange = DateTime.Now;
     }
 
-    private string DockedEdge()
+    private DockEdge DockedEdge()
     {
-        var work = Screen.FromControl(this).WorkingArea;
-        if (Math.Abs(Right - work.Right) <= 16) return "Right";
-        if (Math.Abs(Left - work.Left) <= 16) return "Left";
-        if (Math.Abs(Top - work.Top) <= 16) return "Top";
-        return String.Empty;
+        var work = Screen.FromRectangle(Bounds).WorkingArea;
+        if (Math.Abs(Right - work.Right) <= 16) return DockEdge.Right;
+        if (Math.Abs(Left - work.Left) <= 16) return DockEdge.Left;
+        if (Math.Abs(Top - work.Top) <= 16) return DockEdge.Top;
+        return DockEdge.None;
     }
 
     private void ToggleAutoHide()
@@ -650,59 +706,67 @@ internal sealed class ReaderForm : Form
             return;
         }
         var edge = DockedEdge();
-        if (edge == "Top" && PointerNearTopTrigger()) return;
-        if (!Bounds.Contains(Cursor.Position) && edge.Length > 0) CollapseToEdge(edge);
+        if (edge == DockEdge.Top && PointerNearTopTrigger()) return;
+        if (!Bounds.Contains(Cursor.Position) && edge != DockEdge.None) CollapseToEdge(edge);
     }
 
     private bool PointerNearTopTrigger()
     {
         var point = Cursor.Position;
-        var work = Screen.FromControl(this).WorkingArea;
+        var work = Screen.FromRectangle(Bounds).WorkingArea;
         return point.Y >= work.Top && point.Y <= work.Top + 18 && point.X >= Left && point.X <= Right;
     }
 
     private bool PointerInCollapsedTrigger()
     {
         var point = Cursor.Position;
-        var work = Screen.FromControl(this).WorkingArea;
         const int trigger = 12;
 
-        if (collapsedEdge == "Right")
-            return point.X >= work.Right - trigger && point.X <= work.Right &&
+        if (collapsedEdge == DockEdge.Right)
+            return point.X >= collapsedWorkArea.Right - trigger && point.X < collapsedWorkArea.Right &&
                    point.Y >= expandedBounds.Top && point.Y <= expandedBounds.Bottom;
-        if (collapsedEdge == "Left")
-            return point.X >= work.Left && point.X <= work.Left + trigger &&
+        if (collapsedEdge == DockEdge.Left)
+            return point.X >= collapsedWorkArea.Left && point.X <= collapsedWorkArea.Left + trigger &&
                    point.Y >= expandedBounds.Top && point.Y <= expandedBounds.Bottom;
-        if (collapsedEdge == "Top")
-            return point.Y >= work.Top && point.Y <= work.Top + trigger &&
+        if (collapsedEdge == DockEdge.Top)
+            return point.Y >= collapsedWorkArea.Top && point.Y <= collapsedWorkArea.Top + trigger &&
                    point.X >= expandedBounds.Left && point.X <= expandedBounds.Right;
         return false;
     }
 
-    private void CollapseToEdge(string edge)
+    private void CollapseToEdge(DockEdge edge)
     {
         if (collapsed || transitioning) return;
         if ((DateTime.Now - lastAutoAction).TotalMilliseconds < 900) return;
 
         expandedBounds = Bounds;
-        var work = Screen.FromControl(this).WorkingArea;
-        transitioning = true;
-        collapsed = true;
-        collapsedEdge = edge;
+        var work = Screen.FromRectangle(expandedBounds).WorkingArea;
 
         var target = expandedBounds.Location;
-        if (edge == "Right")
+        if (edge == DockEdge.Right)
             target = new Point(work.Right - 8, ClampTop(work, expandedBounds.Top, expandedBounds.Height));
-        else if (edge == "Left")
+        else if (edge == DockEdge.Left)
             target = new Point(work.Left - expandedBounds.Width + 8, ClampTop(work, expandedBounds.Top, expandedBounds.Height));
         else
             target = new Point(
                 Math.Max(work.Left, Math.Min(expandedBounds.Left, work.Right - expandedBounds.Width)),
                 work.Top - expandedBounds.Height + 8);
 
-        SetWindowPos(Handle, new IntPtr(-1), target.X, target.Y, 0, 0, 0x0001 | 0x0010);
-        transitioning = false;
-        lastAutoAction = DateTime.Now;
+        transitioning = true;
+        try
+        {
+            if (!SetWindowPos(Handle, HwndTopMost, target.X, target.Y, 0, 0, SwpNoSize | SwpNoActivate))
+                return;
+
+            collapsed = true;
+            collapsedEdge = edge;
+            collapsedWorkArea = work;
+            lastAutoAction = DateTime.Now;
+        }
+        finally
+        {
+            transitioning = false;
+        }
     }
 
     private int ClampTop(Rectangle work, int top, int height)
@@ -717,20 +781,30 @@ internal sealed class ReaderForm : Form
         if (!force && (DateTime.Now - lastAutoAction).TotalMilliseconds < 180) return;
 
         transitioning = true;
-        collapsed = false;
-        collapsedEdge = String.Empty;
-        SetWindowPos(
-            Handle,
-            new IntPtr(-2),
-            expandedBounds.Left,
-            expandedBounds.Top,
-            expandedBounds.Width,
-            expandedBounds.Height,
-            0x0010);
-        autoHideArmed = Bounds.Contains(Cursor.Position);
+        try
+        {
+            if (!SetWindowPos(
+                    Handle,
+                    HwndNotTopMost,
+                    expandedBounds.Left,
+                    expandedBounds.Top,
+                    expandedBounds.Width,
+                    expandedBounds.Height,
+                    SwpNoActivate))
+                return;
+
+            collapsed = false;
+            collapsedEdge = DockEdge.None;
+            collapsedWorkArea = Rectangle.Empty;
+            autoHideArmed = expandedBounds.Contains(Cursor.Position);
+            lastAutoAction = DateTime.Now;
+        }
+        finally
+        {
+            transitioning = false;
+        }
+
         if (force) Activate();
-        transitioning = false;
-        lastAutoAction = DateTime.Now;
     }
 
 }
